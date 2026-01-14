@@ -28,6 +28,22 @@ python3 ocr_synth.py --input /path/to/clean_images --output /path/to/out --prese
 - `--num 5`：每张干净图生成 5 张增强图（输出为 `xxx__aug00.png` 这种命名）。
 - `--preset`：`light | medium | heavy` 控制强度/概率。
 
+### 额外：在线增强（训练时 on-the-fly）
+
+仓库也提供了一个更“在线”的增强模块 `online_augment.py`，包含：
+
+- **反锐化**：只对边缘区域做高斯模糊并混合，让边缘不再清晰
+- **灰度增益**：\(y = x \cdot a + b\)（对每个像素/通道统一做线性变换）模拟强光照/弱光照
+
+示例（numpy / torch 都可用）：
+
+```python
+from online_augment import OnlineAugment
+
+aug = OnlineAugment(seed=123)
+img_aug = aug(img)  # img: numpy(HWC uint8) 或 torch(CHW float/uint8)
+```
+
 ### 2) 使用你的“干扰示意图/截图”作为纹理库叠加
 
 把干扰图（反光/底纹/污渍/纸张纹理/墨迹等）放到一个目录，例如 `/path/to/textures`：
