@@ -1,0 +1,76 @@
+# OCR 工业干扰合成（从干净字体图生成反光/墨迹/过印/连体等）
+
+工业 OCR 字符检测在真实产线常见的难点是**背景干扰**（反光、污渍、过印/重影、连体/粘连、模糊、压缩噪声、底纹等）。如果你手头只有“干净字体图”，同时有一些“干扰示意图/真实干扰截图”，可以用**合成数据增强**把干净图变成更贴近产线的训练数据。
+
+本仓库新增脚本 `ocr_synth.py`：对干净字图做**默认不改变几何**的扰动（尽量不破坏字符检测框标注），并支持把你提供的干扰示意图当作“纹理库”进行随机叠加。
+
+## 你应该怎么做（建议流程）
+
+- **用你的真实干扰图校准增强强度**：先小规模生成（比如每张 5~10 张），肉眼对比你的工业场景，调整 `preset`（light/medium/heavy）和纹理库。
+- **优先合成“只改像素，不改几何”的干扰**：反光、墨迹、过印、模糊、压缩、光照不均、底纹等，这类通常不需要重算 bbox。
+- **连体/粘连属于“形态变化”**：会改变笔画粗细/连接方式，但大多数情况下仍在原 bbox 内；如果你 bbox 很紧，建议把标注适当放宽或改用实例/文本行级标注。
+- **如果你要做透视/旋转/拉伸等几何扰动**：需要同步更新标注（bbox/多边形）。当前脚本默认不做这类扰动。
+
+## 安装依赖
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+## 用法
+
+### 1) 对已有干净字图批量合成
+
+```bash
+python3 ocr_synth.py --input /path/to/clean_images --output /path/to/out --preset medium --num 5
+```
+
+- `--num 5`：每张干净图生成 5 张增强图（输出为 `xxx__aug00.png` 这种命名）。
+- `--preset`：`light | medium | heavy` 控制强度/概率。
+
+### 额外：在线增强（训练时 on-the-fly）
+
+仓库也提供了一个更“在线”的增强模块 `online_augment.py`，包含：
+
+- **反锐化**：只对边缘区域做高斯模糊并混合，让边缘不再清晰
+- **灰度增益**：\(y = x \cdot a + b\)（对每个像素/通道统一做线性变换）模拟强光照/弱光照
+
+示例（numpy / torch 都可用）：
+
+```python
+from online_augment import OnlineAugment
+
+aug = OnlineAugment(seed=123)
+img_aug = aug(img)  # img: numpy(HWC uint8) 或 torch(CHW float/uint8)
+```
+
+### 2) 使用你的“干扰示意图/截图”作为纹理库叠加
+
+把干扰图（反光/底纹/污渍/纸张纹理/墨迹等）放到一个目录，例如 `/path/to/textures`：
+
+```bash
+python3 ocr_synth.py --input /path/to/clean_images --textures /path/to/textures --output /path/to/out --preset medium --num 5
+```
+
+脚本会随机从纹理库裁剪一块，缩放到目标大小，再用 multiply/screen 的方式进行叠加，用于模拟**底纹/脏污/雾化高光**等。
+
+### 3) 没有干净字图？先生成 demo 再合成（自检）
+
+```bash
+python3 ocr_synth.py --demo 20 --output ./out_demo --preset heavy --num 3
+```
+
+会先在 `./out_demo/_demo_clean/` 生成 20 张简单的“干净文本图”，再对它们做增强。
+
+## 你提供的干扰示意图怎么用得更像
+
+如果你的示意图里主要是某一类干扰（例如反光条纹、固定底纹、某种墨迹形态）：
+
+- **把示意图按类型分文件夹**：`textures/glare/`、`textures/ink/`、`textures/paper/`…
+- 训练时按类别采样（例如反光 30%，墨迹 40%，底纹 50%），能更可控地复现产线分布
+- 后续也可以进一步做“参数拟合”：从你的真实样本里统计亮度直方图、反光长度/方向、污渍面积比例、重影位移范围等，然后把这些统计量写回增强参数范围
+
+---
+
+如果你愿意贴两三张“干净字图 + 典型干扰真实图”（不必成对），我可以把脚本里的各类干扰参数范围按你的场景直接调到更贴合的分布。
+
