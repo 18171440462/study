@@ -38,3 +38,16 @@ CSV 至少需要列：`time`/`ts`、`price`、`volume`；可选列：`side`（B/
 python3 au9999_watch.py --trades trades.csv --lookback 600 --size-small 1000 --size-medium 5000
 ```
 
+### 打印“散户/机构 买入/卖出”提示信号（需要逐笔 CSV）
+
+脚本用 **小单净量** 代理“散户”，用 **大单净量** 代理“机构”。当净量绝对值超过阈值时触发提示，并且只在状态变化时打印一次以避免刷屏。
+
+```bash
+python3 au9999_watch.py \
+  --trades trades.csv \
+  --signal \
+  --lookback 600 \
+  --signal-threshold-retail 3000 \
+  --signal-threshold-institution 3000
+```
+

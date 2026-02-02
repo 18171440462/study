@@ -238,6 +238,12 @@ class FlowSummary:
     net_large: float
 
 
+@dataclass(frozen=True)
+class FlowSignalState:
+    retail: int  # -1 sell, 0 neutral, +1 buy
+    institution: int  # -1 sell, 0 neutral, +1 buy
+
+
 def summarize_flows_by_size(
     trades: List[TradePrint],
     size_small: float,
@@ -265,6 +271,39 @@ def summarize_flows_by_size(
     return FlowSummary(net_total=ns + nm + nl, net_small=ns, net_medium=nm, net_large=nl)
 
 
+def flow_signal_state_from_summary(
+    flow: FlowSummary,
+    threshold_retail: float,
+    threshold_institution: float,
+) -> FlowSignalState:
+    """
+    Proxy rule:
+    - retail side is inferred from small-trade net volume (net_small)
+    - institution side is inferred from large-trade net volume (net_large)
+    Thresholds avoid noisy flips.
+    """
+
+    def state(x: float, th: float) -> int:
+        if x >= th:
+            return 1
+        if x <= -th:
+            return -1
+        return 0
+
+    return FlowSignalState(
+        retail=state(flow.net_small, float(threshold_retail)),
+        institution=state(flow.net_large, float(threshold_institution)),
+    )
+
+
+def describe_flow_signal(state: int, who: str) -> Optional[str]:
+    if state == 1:
+        return f"{who}净买入"
+    if state == -1:
+        return f"{who}净卖出"
+    return None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="AU9999(Au99.99) watch + proxy flow signals")
     ap.add_argument("--symbol", default="Au99.99", help="SGE instrument id (default: Au99.99)")
@@ -277,11 +316,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--lookback", type=int, default=600, help="Trade flow lookback seconds (default: 600)")
     ap.add_argument("--size-small", type=float, default=1000.0, help="Small trade volume threshold (default: 1000)")
     ap.add_argument("--size-medium", type=float, default=5000.0, help="Medium trade volume threshold (default: 5000)")
+    ap.add_argument(
+        "--signal",
+        action="store_true",
+        help="Print retail/institution buy/sell signals (requires --trades)",
+    )
+    ap.add_argument(
+        "--signal-threshold-retail",
+        type=float,
+        default=3000.0,
+        help="Min |small-net| to trigger retail signal (default: 3000)",
+    )
+    ap.add_argument(
+        "--signal-threshold-institution",
+        type=float,
+        default=3000.0,
+        help="Min |large-net| to trigger institution signal (default: 3000)",
+    )
 
     args = ap.parse_args(argv)
 
     points: List[QuotePoint] = []
     last_printed_ts: Optional[dt.datetime] = None
+    last_flow_state: Optional[FlowSignalState] = None
 
     def emit_line(s: str) -> None:
         sys.stdout.write(s + "\n")
@@ -335,8 +392,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                     f"  逐笔代理净量(近{args.lookback}s): 总={flow.net_total:+.0f}"
                     f" 小单={flow.net_small:+.0f} 中单={flow.net_medium:+.0f} 大单={flow.net_large:+.0f}"
                 )
+
+                if args.signal:
+                    state = flow_signal_state_from_summary(
+                        flow=flow,
+                        threshold_retail=float(args.signal_threshold_retail),
+                        threshold_institution=float(args.signal_threshold_institution),
+                    )
+                    # Only print when signal state changes to reduce spam
+                    if last_flow_state is None or state != last_flow_state:
+                        last_flow_state = state
+                        retail_msg = describe_flow_signal(state.retail, "散户")
+                        inst_msg = describe_flow_signal(state.institution, "机构")
+                        if retail_msg or inst_msg:
+                            parts = [p for p in [retail_msg, inst_msg] if p]
+                            emit_line(
+                                "  SIGNAL(逐笔代理): "
+                                + "；".join(parts)
+                                + f" | 阈值 小单={args.signal_threshold_retail:.0f} 大单={args.signal_threshold_institution:.0f}"
+                            )
+                        else:
+                            emit_line("  SIGNAL(逐笔代理): 无（净量未达阈值）")
             except Exception as e:
                 emit_line(f"  读取 trades CSV 失败: {e}")
+        elif args.signal:
+            emit_line("  SIGNAL: 需要提供 --trades 才能判定散户/机构买卖（仅用价格不做交易流向判定）")
 
         if args.once:
             return 0
