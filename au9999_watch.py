@@ -51,28 +51,98 @@ class QuotePoint:
     price: float
 
 
-def fetch_latest_quote(symbol: str = "Au99.99") -> QuotePoint:
-    ak = _lazy_import_akshare()
-    df = ak.spot_quotations_sge(symbol=symbol)
-    if df is None or getattr(df, "empty", True):
-        raise RuntimeError(f"No data returned for symbol={symbol!r}")
+def _requests_session_with_retries():
+    """
+    Best-effort requests Session with retry adapter.
+    If requests isn't available for any reason, caller should fall back.
+    """
+    import requests  # type: ignore
 
-    # df columns: 品种, 时间 (datetime.time), 现价 (float), 更新时间 (string)
-    update_ts = parse_sge_update_time(str(df["更新时间"].iloc[0]))
-    last = df.iloc[-1]
+    try:
+        from urllib3.util.retry import Retry  # type: ignore
+        from requests.adapters import HTTPAdapter  # type: ignore
 
-    t = last["时间"]
-    if isinstance(t, str):
-        # fallback: 'HH:MM:SS' or 'HH:MM'
-        parts = t.split(":")
-        hh, mm = int(parts[0]), int(parts[1])
-        ss = int(parts[2]) if len(parts) >= 3 else 0
-        t = dt.time(hh, mm, ss)
-    if not isinstance(t, dt.time):
-        raise RuntimeError(f"Unexpected time value: {t!r}")
+        retry = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            status=2,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET", "POST"),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        s = requests.Session()
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        return s
+    except Exception:
+        return requests.Session()
 
+
+def fetch_latest_quote(symbol: str = "Au99.99", timeout_seconds: float = 10.0) -> QuotePoint:
+    """
+    Fetch latest Au spot quote from SGE 'graph/quotations' endpoint.
+
+    Notes:
+    - The remote endpoint sometimes rate-limits or closes connections.
+      We therefore use a bounded timeout and lightweight retries.
+    """
+    try:
+        import requests  # type: ignore
+    except Exception:
+        # last resort: use akshare (may still fail similarly)
+        ak = _lazy_import_akshare()
+        df = ak.spot_quotations_sge(symbol=symbol)
+        if df is None or getattr(df, "empty", True):
+            raise RuntimeError(f"No data returned for symbol={symbol!r}")
+        update_ts = parse_sge_update_time(str(df["更新时间"].iloc[0]))
+        last = df.iloc[-1]
+        t = last["时间"]
+        if isinstance(t, str):
+            parts = t.split(":")
+            hh, mm = int(parts[0]), int(parts[1])
+            ss = int(parts[2]) if len(parts) >= 3 else 0
+            t = dt.time(hh, mm, ss)
+        if not isinstance(t, dt.time):
+            raise RuntimeError(f"Unexpected time value: {t!r}")
+        ts = dt.datetime.combine(update_ts.date(), t)
+        return QuotePoint(ts=ts, price=float(last["现价"]))
+
+    url = "https://www.sge.com.cn/graph/quotations"
+    params = {"instid": symbol}
+    headers = {
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Host": "www.sge.com.cn",
+        "Pragma": "no-cache",
+        "Referer": "https://www.sge.com.cn/",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    s = _requests_session_with_retries()
+    r = s.get(url, params=params, headers=headers, timeout=float(timeout_seconds))
+    r.raise_for_status()
+    data_json = r.json()
+
+    # data_json contains: heyue, times, data, delaystr
+    update_ts = parse_sge_update_time(str(data_json.get("delaystr", "")).strip())
+    times = data_json.get("times") or []
+    datas = data_json.get("data") or []
+    if not times or not datas:
+        raise RuntimeError(f"No quote points returned for symbol={symbol!r}")
+
+    # pick the last element, parse time 'HH:MM'
+    t_s = str(times[-1])
+    parts = t_s.split(":")
+    hh, mm = int(parts[0]), int(parts[1])
+    ss = int(parts[2]) if len(parts) >= 3 else 0
+    t = dt.time(hh, mm, ss)
     ts = dt.datetime.combine(update_ts.date(), t)
-    price = float(last["现价"])
+    price = float(datas[-1])
     return QuotePoint(ts=ts, price=price)
 
 
@@ -445,6 +515,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--window", type=int, default=180, help="Rolling window seconds (default: 180)")
     ap.add_argument("--min-move", type=float, default=0.3, help="Min price move to call directional (default: 0.3)")
     ap.add_argument("--once", action="store_true", help="Fetch once and exit")
+    ap.add_argument("--timeout", type=float, default=10.0, help="HTTP timeout seconds (default: 10)")
+    ap.add_argument(
+        "--max-fail-sleep",
+        type=float,
+        default=30.0,
+        help="Max sleep seconds after consecutive failures (default: 30)",
+    )
 
     ap.add_argument("--trades", default=None, help="Optional trades CSV path for net flow estimation")
     ap.add_argument("--lookback", type=int, default=600, help="Trade flow lookback seconds (default: 600)")
@@ -510,6 +587,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     last_flow_state: Optional[FlowSignalState] = None
     last_futures_state: Optional[FlowSignalState] = None
     last_futures_fetch_t: float = 0.0
+    consecutive_quote_failures: int = 0
 
     def emit_line(s: str) -> None:
         sys.stdout.write(s + "\n")
@@ -532,13 +610,57 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     while True:
+        # 1) SGE spot quote (may fail intermittently)
         try:
-            q = fetch_latest_quote(symbol=args.symbol)
+            q = fetch_latest_quote(symbol=args.symbol, timeout_seconds=float(args.timeout))
+            consecutive_quote_failures = 0
         except Exception as e:
+            consecutive_quote_failures += 1
             emit_line(f"[{dt.datetime.now().isoformat(timespec='seconds')}] 获取行情失败: {e}")
+            q = None
+
+        # 2) Futures proxy signal can still run even if spot quote fails
+        if args.signal and not args.trades:
+            now = time.time()
+            if (now - last_futures_fetch_t) >= max(1, int(args.futures_signal_interval)):
+                last_futures_fetch_t = now
+                try:
+                    bars = fetch_futures_minute_bars(symbol=str(args.futures_symbol), period="1")
+                    metrics = compute_futures_proxy_metrics(
+                        df=bars,
+                        symbol=str(args.futures_symbol),
+                        lookback_seconds=int(args.futures_lookback),
+                    )
+                    if metrics is None:
+                        emit_line("  SIGNAL(AU期货代理): 获取/解析失败（无数据）")
+                    else:
+                        lines, state = futures_proxy_signal_lines(
+                            m=metrics,
+                            threshold_oi=float(args.futures_threshold_oi),
+                            threshold_price=float(args.futures_threshold_price),
+                            threshold_signed_volume=float(args.futures_threshold_signed_volume),
+                        )
+                        emit_line(
+                            f"  AU期货代理(近{args.futures_lookback}s): {metrics.symbol} "
+                            f"ΔP={metrics.price_change:+.2f} ΔOI={metrics.hold_change:+.0f} "
+                            f"SV={metrics.signed_volume:+.0f} @ {metrics.ts.strftime('%H:%M:%S')}"
+                        )
+                        if last_futures_state is None or state != last_futures_state:
+                            last_futures_state = state
+                            if lines:
+                                for s in lines:
+                                    emit_line(f"  SIGNAL(AU期货代理): {s}")
+                            else:
+                                emit_line("  SIGNAL(AU期货代理): 无（未达阈值/无明显结构）")
+                except Exception as e:
+                    emit_line(f"  SIGNAL(AU期货代理): 获取失败: {e}")
+
+        if q is None:
             if args.once:
                 return 2
-            time.sleep(max(1.0, args.interval))
+            # Backoff on consecutive failures to reduce rate-limit risk
+            backoff = min(float(args.max_fail_sleep), float(args.interval) * (2 ** max(0, consecutive_quote_failures - 1)))
+            time.sleep(max(1.0, backoff))
             continue
 
         # De-dup: SGE endpoint may repeat last minute
@@ -598,40 +720,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             emit_line("  SIGNAL(逐笔代理): 无（净量未达阈值）")
             except Exception as e:
                 emit_line(f"  读取 trades CSV 失败: {e}")
-        elif args.signal:
-            now = time.time()
-            if (now - last_futures_fetch_t) >= max(1, int(args.futures_signal_interval)):
-                last_futures_fetch_t = now
-                try:
-                    bars = fetch_futures_minute_bars(symbol=str(args.futures_symbol), period="1")
-                    metrics = compute_futures_proxy_metrics(
-                        df=bars,
-                        symbol=str(args.futures_symbol),
-                        lookback_seconds=int(args.futures_lookback),
-                    )
-                    if metrics is None:
-                        emit_line("  SIGNAL(AU期货代理): 获取/解析失败（无数据）")
-                    else:
-                        lines, state = futures_proxy_signal_lines(
-                            m=metrics,
-                            threshold_oi=float(args.futures_threshold_oi),
-                            threshold_price=float(args.futures_threshold_price),
-                            threshold_signed_volume=float(args.futures_threshold_signed_volume),
-                        )
-                        emit_line(
-                            f"  AU期货代理(近{args.futures_lookback}s): {metrics.symbol} "
-                            f"ΔP={metrics.price_change:+.2f} ΔOI={metrics.hold_change:+.0f} "
-                            f"SV={metrics.signed_volume:+.0f} @ {metrics.ts.strftime('%H:%M:%S')}"
-                        )
-                        if last_futures_state is None or state != last_futures_state:
-                            last_futures_state = state
-                            if lines:
-                                for s in lines:
-                                    emit_line(f"  SIGNAL(AU期货代理): {s}")
-                            else:
-                                emit_line("  SIGNAL(AU期货代理): 无（未达阈值/无明显结构）")
-                except Exception as e:
-                    emit_line(f"  SIGNAL(AU期货代理): 获取失败: {e}")
+        # futures proxy already handled above; no-op here
 
         if args.once:
             return 0
