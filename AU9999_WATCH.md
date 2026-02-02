@@ -51,3 +51,22 @@ python3 au9999_watch.py \
   --signal-threshold-institution 3000
 ```
 
+### 没有逐笔 CSV（常见）：用 AU期货(AU0) 作为代理源输出信号
+
+如果你总是没有 `trades.csv`，可以直接开启 `--signal`。脚本会自动拉取 **上期所黄金 AU 连续(AU0) 的 1分钟数据**（含成交量与持仓 `hold`），用以下代理逻辑打印散户/机构买卖提示：
+
+- **机构代理**：用 \( \Delta OI \)（`hold`变化） + \( \Delta P \)（价格变化）推断“疑似开多/开空/平仓”
+- **散户代理**：当 \( | \Delta OI | \) 不大但“签名成交量”(SV) 明显偏向一侧时，提示“散户疑似净买/净卖”
+
+```bash
+python3 au9999_watch.py --signal
+
+# 可调阈值（不同盘面波动强弱差异很大）
+python3 au9999_watch.py \
+  --signal \
+  --futures-lookback 600 \
+  --futures-threshold-oi 200 \
+  --futures-threshold-price 0.5 \
+  --futures-threshold-signed-volume 8000
+```
+

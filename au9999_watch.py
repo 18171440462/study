@@ -304,6 +304,140 @@ def describe_flow_signal(state: int, who: str) -> Optional[str]:
     return None
 
 
+@dataclass(frozen=True)
+class FuturesProxyMetrics:
+    symbol: str
+    ts: dt.datetime
+    price_last: float
+    price_change: float
+    hold_last: float
+    hold_change: float
+    signed_volume: float
+
+
+def fetch_futures_minute_bars(symbol: str, period: str = "1"):
+    """
+    Fetch minute bars with volume + hold (OI proxy) via akshare.
+
+    Expected columns: datetime, open, high, low, close, volume, hold
+    """
+    ak = _lazy_import_akshare()
+    return ak.futures_zh_minute_sina(symbol=symbol, period=period)
+
+
+def compute_futures_proxy_metrics(
+    df,
+    symbol: str,
+    lookback_seconds: int,
+) -> Optional[FuturesProxyMetrics]:
+    if df is None or getattr(df, "empty", True):
+        return None
+    if "datetime" not in df.columns or "close" not in df.columns:
+        return None
+
+    # Ensure types
+    d = df.copy()
+    d["datetime"] = dt.datetime.fromisoformat(str(d["datetime"].iloc[-1])) if False else d["datetime"]
+    try:
+        d["datetime"] = d["datetime"].astype("datetime64[ns]")
+    except Exception:
+        # fallback: try parse strings
+        d["datetime"] = d["datetime"].apply(lambda x: _parse_time_any(str(x)))
+
+    for col in ("close", "volume", "hold"):
+        if col in d.columns:
+            try:
+                d[col] = d[col].astype(float)
+            except Exception:
+                pass
+
+    last_row = d.iloc[-1]
+    ts = last_row["datetime"]
+    if isinstance(ts, dt.datetime):
+        last_ts = ts
+    else:
+        # numpy datetime64 -> python datetime
+        last_ts = dt.datetime.fromtimestamp(ts.astype("datetime64[s]").astype(int))
+
+    cutoff = last_ts - dt.timedelta(seconds=int(lookback_seconds))
+    d_lb = d[d["datetime"] >= cutoff]
+    if d_lb.empty:
+        d_lb = d.tail(min(len(d), 3))
+    if len(d_lb) < 2:
+        return None
+
+    price_last = float(d_lb["close"].iloc[-1])
+    price_first = float(d_lb["close"].iloc[0])
+    price_change = price_last - price_first
+
+    hold_last = float(d_lb["hold"].iloc[-1]) if "hold" in d_lb.columns else float("nan")
+    hold_first = float(d_lb["hold"].iloc[0]) if "hold" in d_lb.columns else float("nan")
+    hold_change = hold_last - hold_first if (not math.isnan(hold_last) and not math.isnan(hold_first)) else float("nan")
+
+    # Signed volume proxy: sign(close - prev_close) * volume
+    closes = d_lb["close"].tolist()
+    vols = d_lb["volume"].tolist() if "volume" in d_lb.columns else [0.0] * len(closes)
+    sv = 0.0
+    for i in range(1, len(closes)):
+        sv += float(_sign(float(closes[i]) - float(closes[i - 1]))) * float(vols[i])
+
+    return FuturesProxyMetrics(
+        symbol=symbol,
+        ts=last_ts,
+        price_last=price_last,
+        price_change=price_change,
+        hold_last=hold_last,
+        hold_change=hold_change,
+        signed_volume=sv,
+    )
+
+
+def futures_proxy_signal_lines(
+    m: FuturesProxyMetrics,
+    threshold_oi: float,
+    threshold_price: float,
+    threshold_signed_volume: float,
+) -> Tuple[List[str], FlowSignalState]:
+    """
+    Produce proxy retail/institution buy/sell using futures minute bars:
+    - Institution: uses hold(OI) change + price change.
+    - Retail: uses signed volume, but only when |OI change| small (churn-like).
+    """
+    lines: List[str] = []
+    inst = 0
+    retail = 0
+
+    oi = m.hold_change
+    px = m.price_change
+    sv = m.signed_volume
+
+    # Institution proxy: new positions (OI up) aligned with price direction
+    if not math.isnan(oi):
+        if oi >= threshold_oi and px >= threshold_price:
+            inst = 1
+            lines.append("机构疑似开多（AU期货 OI↑ 且 价↑；代理）")
+        elif oi >= threshold_oi and px <= -threshold_price:
+            inst = -1
+            lines.append("机构疑似开空（AU期货 OI↑ 且 价↓；代理）")
+        elif oi <= -threshold_oi and px >= threshold_price:
+            # short covering looks like buying
+            inst = 1
+            lines.append("机构疑似平空/回补（AU期货 OI↓ 且 价↑；代理）")
+        elif oi <= -threshold_oi and px <= -threshold_price:
+            # long liquidation looks like selling
+            inst = -1
+            lines.append("机构疑似平多/止损（AU期货 OI↓ 且 价↓；代理）")
+
+    # Retail proxy: churny flow with small OI change, but clear signed volume pressure
+    if abs(sv) >= threshold_signed_volume and (math.isnan(oi) or abs(oi) < threshold_oi * 0.5):
+        retail = 1 if sv > 0 else -1
+        lines.append("散户疑似净买入" if retail == 1 else "散户疑似净卖出")
+        lines[-1] += "（AU期货 分时量价签名；代理）"
+
+    state = FlowSignalState(retail=retail, institution=inst)
+    return lines, state
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="AU9999(Au99.99) watch + proxy flow signals")
     ap.add_argument("--symbol", default="Au99.99", help="SGE instrument id (default: Au99.99)")
@@ -319,7 +453,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument(
         "--signal",
         action="store_true",
-        help="Print retail/institution buy/sell signals (requires --trades)",
+        help="Print retail/institution buy/sell signals (use --trades; or proxy via AU futures when no trades)",
     )
     ap.add_argument(
         "--signal-threshold-retail",
@@ -333,19 +467,58 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=3000.0,
         help="Min |large-net| to trigger institution signal (default: 3000)",
     )
+    ap.add_argument(
+        "--futures-symbol",
+        default="AU0",
+        help="Futures symbol used as proxy when no --trades (default: AU0)",
+    )
+    ap.add_argument(
+        "--futures-lookback",
+        type=int,
+        default=600,
+        help="AU futures proxy lookback seconds (default: 600)",
+    )
+    ap.add_argument(
+        "--futures-signal-interval",
+        type=int,
+        default=30,
+        help="Minimum seconds between futures proxy refresh (default: 30)",
+    )
+    ap.add_argument(
+        "--futures-threshold-oi",
+        type=float,
+        default=200.0,
+        help="Min |OI(hold) change| to trigger institution proxy (default: 200)",
+    )
+    ap.add_argument(
+        "--futures-threshold-price",
+        type=float,
+        default=0.5,
+        help="Min |price change| over lookback to trigger OI proxy (default: 0.5)",
+    )
+    ap.add_argument(
+        "--futures-threshold-signed-volume",
+        type=float,
+        default=8000.0,
+        help="Min |signed volume| to trigger retail proxy (default: 8000)",
+    )
 
     args = ap.parse_args(argv)
 
     points: List[QuotePoint] = []
     last_printed_ts: Optional[dt.datetime] = None
     last_flow_state: Optional[FlowSignalState] = None
+    last_futures_state: Optional[FlowSignalState] = None
+    last_futures_fetch_t: float = 0.0
 
     def emit_line(s: str) -> None:
         sys.stdout.write(s + "\n")
         sys.stdout.flush()
 
     if args.signal and not args.trades:
-        emit_line("注意：已开启 --signal，但未提供 --trades；仅用价格不会判定散户/机构买卖。")
+        emit_line(
+            "注意：未提供逐笔数据（--trades）；将改用 AU期货(AU0) 的分时成交量+持仓(OI) 作为代理来提示散户/机构买卖。"
+        )
     elif args.trades and args.signal:
         emit_line(
             "注意：散户/机构信号为“逐笔代理”（小单≈散户、大单≈机构，按净量阈值触发），"
@@ -426,7 +599,39 @@ def main(argv: Optional[List[str]] = None) -> int:
             except Exception as e:
                 emit_line(f"  读取 trades CSV 失败: {e}")
         elif args.signal:
-            emit_line("  SIGNAL: 需要提供 --trades 才能判定散户/机构买卖（仅用价格不做交易流向判定）")
+            now = time.time()
+            if (now - last_futures_fetch_t) >= max(1, int(args.futures_signal_interval)):
+                last_futures_fetch_t = now
+                try:
+                    bars = fetch_futures_minute_bars(symbol=str(args.futures_symbol), period="1")
+                    metrics = compute_futures_proxy_metrics(
+                        df=bars,
+                        symbol=str(args.futures_symbol),
+                        lookback_seconds=int(args.futures_lookback),
+                    )
+                    if metrics is None:
+                        emit_line("  SIGNAL(AU期货代理): 获取/解析失败（无数据）")
+                    else:
+                        lines, state = futures_proxy_signal_lines(
+                            m=metrics,
+                            threshold_oi=float(args.futures_threshold_oi),
+                            threshold_price=float(args.futures_threshold_price),
+                            threshold_signed_volume=float(args.futures_threshold_signed_volume),
+                        )
+                        emit_line(
+                            f"  AU期货代理(近{args.futures_lookback}s): {metrics.symbol} "
+                            f"ΔP={metrics.price_change:+.2f} ΔOI={metrics.hold_change:+.0f} "
+                            f"SV={metrics.signed_volume:+.0f} @ {metrics.ts.strftime('%H:%M:%S')}"
+                        )
+                        if last_futures_state is None or state != last_futures_state:
+                            last_futures_state = state
+                            if lines:
+                                for s in lines:
+                                    emit_line(f"  SIGNAL(AU期货代理): {s}")
+                            else:
+                                emit_line("  SIGNAL(AU期货代理): 无（未达阈值/无明显结构）")
+                except Exception as e:
+                    emit_line(f"  SIGNAL(AU期货代理): 获取失败: {e}")
 
         if args.once:
             return 0
