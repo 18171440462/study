@@ -42,11 +42,14 @@ class AkshareSgeAu9999Provider:
 
         self._ak = ak
 
-    def fetch_latest(self) -> Tick:
+    def _fetch_df(self) -> pd.DataFrame:
         df = self._ak.spot_quotations_sge()
         if df is None or df.empty:
             raise RuntimeError("Empty dataframe from akshare.spot_quotations_sge()")
+        return df
 
+    @staticmethod
+    def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         required_cols = {"时间", "现价", "更新时间"}
         missing = required_cols - set(df.columns)
         if missing:
@@ -55,6 +58,7 @@ class AkshareSgeAu9999Provider:
         # '时间' is HH:MM:SS, pick the latest time.
         # Note: sometimes the source keeps older rows; 更新时间 is the fetch timestamp in Chinese format.
         df2 = df.copy()
+
         def _time_to_seconds(v) -> Optional[int]:
             if isinstance(v, dt.time):
                 return v.hour * 3600 + v.minute * 60 + v.second
@@ -71,9 +75,10 @@ class AkshareSgeAu9999Provider:
         df2 = df2.dropna(subset=["_t"]).astype({"_t": "int64"})
         if df2.empty:
             raise RuntimeError("Could not parse time column from data source")
+        return df2
 
-        row = df2.loc[df2["_t"].idxmax()]
-
+    @staticmethod
+    def _row_to_tick(row: pd.Series) -> Tick:
         price = float(row["现价"])
         source_updated_at = str(row.get("更新时间")) if "更新时间" in row else None
 
@@ -87,6 +92,16 @@ class AkshareSgeAu9999Provider:
             ts = dt.datetime.now()
 
         return Tick(ts=ts, price=price, source_updated_at=source_updated_at)
+
+    def fetch_window(self, window_size: int) -> list[Tick]:
+        df = self._fetch_df()
+        df2 = self._normalize_df(df)
+        df2 = df2.sort_values("_t", ascending=True)
+        tail = df2.tail(max(1, int(window_size)))
+        return [self._row_to_tick(row) for _, row in tail.iterrows()]
+
+    def fetch_latest(self) -> Tick:
+        return self.fetch_window(1)[-1]
 
 
 def _pct(a: float, b: float) -> float:
@@ -155,7 +170,12 @@ def compute_price_action(window: Deque[Tick]) -> dict:
     else:
         who = "机构/散户不明朗（混合状态）"
 
-    confidence = int(round(100.0 * max(inst_score, retail_score) * min(1.0, trend_strength / 3.0)))
+    # Conservative confidence:
+    # - directionality: higher when trend dominates volatility
+    # - dominance: higher when "institution vs retail" score is far from 0.5
+    directionality = math.tanh(trend_strength / 3.0)  # 0..1
+    dominance = abs(inst_score - 0.5) * 2.0  # 0..1
+    confidence = int(round(100.0 * (0.65 * directionality + 0.35 * dominance)))
 
     return {
         "ready": True,
@@ -236,8 +256,10 @@ def main() -> int:
             console.print(f"[yellow]CSV 写入失败：{e}[/yellow]")
 
     def one_shot() -> int:
-        latest = provider.fetch_latest()
-        window.append(latest)
+        seed = provider.fetch_window(window.maxlen)
+        for t in seed:
+            window.append(t)
+        latest = window[-1]
         metrics = compute_price_action(window)
         console.print(render_table(latest, window, metrics))
         append_csv(latest)
@@ -247,6 +269,16 @@ def main() -> int:
         return one_shot()
 
     with Live(console=console, refresh_per_second=4) as live:
+        try:
+            seed = provider.fetch_window(window.maxlen)
+            for t in seed:
+                window.append(t)
+            latest = window[-1]
+            last_seen_key = (latest.ts, latest.price)
+            live.update(render_table(latest, window, compute_price_action(window)))
+        except Exception as e:
+            console.print(f"[yellow]初始化窗口失败，将进入轮询：{type(e).__name__}: {e}[/yellow]")
+
         while True:
             try:
                 latest = provider.fetch_latest()
