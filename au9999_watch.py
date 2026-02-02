@@ -344,9 +344,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stdout.write(s + "\n")
         sys.stdout.flush()
 
-    emit_line(
-        "注意：散户/机构“流入流出”需要逐笔成交/盘口等数据；仅用价格只能做代理推断。"
-    )
+    if args.signal and not args.trades:
+        emit_line("注意：已开启 --signal，但未提供 --trades；仅用价格不会判定散户/机构买卖。")
+    elif args.trades and args.signal:
+        emit_line(
+            "注意：散户/机构信号为“逐笔代理”（小单≈散户、大单≈机构，按净量阈值触发），"
+            "并非真实身份识别；未使用Level2/席位数据。"
+        )
+    elif args.trades:
+        emit_line("注意：逐笔净量为“代理估计”（基于tick rule/side列），并非真实资金流。")
+    else:
+        emit_line(
+            "注意：散户/机构“流入流出”需要逐笔成交/盘口等数据；仅用价格只能做代理推断。"
+        )
 
     while True:
         try:
