@@ -22,6 +22,7 @@ import argparse
 import csv
 import datetime as dt
 import math
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -51,7 +52,7 @@ class QuotePoint:
     price: float
 
 
-def _requests_session_with_retries():
+def _requests_session_with_retries(*, trust_env: bool = False):
     """
     Best-effort requests Session with retry adapter.
     If requests isn't available for any reason, caller should fall back.
@@ -74,14 +75,23 @@ def _requests_session_with_retries():
         )
         adapter = HTTPAdapter(max_retries=retry)
         s = requests.Session()
+        # Avoid flaky/misconfigured corporate proxies from env vars.
+        # If user explicitly wants proxies, they can set trust_env=True by editing code.
+        s.trust_env = bool(trust_env)
         s.mount("https://", adapter)
         s.mount("http://", adapter)
         return s
     except Exception:
-        return requests.Session()
+        s = requests.Session()
+        s.trust_env = bool(trust_env)
+        return s
 
 
-def fetch_latest_quote(symbol: str = "Au99.99", timeout_seconds: float = 10.0) -> QuotePoint:
+def fetch_latest_quote(
+    symbol: str = "Au99.99",
+    timeout_seconds: float = 10.0,
+    session=None,
+) -> QuotePoint:
     """
     Fetch latest Au spot quote from SGE 'graph/quotations' endpoint.
 
@@ -123,7 +133,7 @@ def fetch_latest_quote(symbol: str = "Au99.99", timeout_seconds: float = 10.0) -
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
         "X-Requested-With": "XMLHttpRequest",
     }
-    s = _requests_session_with_retries()
+    s = session or _requests_session_with_retries(trust_env=False)
     r = s.get(url, params=params, headers=headers, timeout=float(timeout_seconds))
     r.raise_for_status()
     data_json = r.json()
@@ -522,6 +532,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=30.0,
         help="Max sleep seconds after consecutive failures (default: 30)",
     )
+    ap.add_argument(
+        "--quote-min-interval",
+        type=float,
+        default=20.0,
+        help="Min seconds between spot quote requests (default: 20; reduce rate-limit risk)",
+    )
+    ap.add_argument(
+        "--jitter",
+        type=float,
+        default=2.0,
+        help="Random sleep jitter seconds added between loops (default: 2)",
+    )
+    ap.add_argument(
+        "--align-minute",
+        action="store_true",
+        help="Align spot quote requests to next minute boundary (recommended for minute-level data)",
+    )
 
     ap.add_argument("--trades", default=None, help="Optional trades CSV path for net flow estimation")
     ap.add_argument("--lookback", type=int, default=600, help="Trade flow lookback seconds (default: 600)")
@@ -588,6 +615,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     last_futures_state: Optional[FlowSignalState] = None
     last_futures_fetch_t: float = 0.0
     consecutive_quote_failures: int = 0
+    last_quote_fetch_t: float = 0.0
+    quote_session = None
+    try:
+        # Create one session (keep-alive), ignore env proxies by default.
+        quote_session = _requests_session_with_retries(trust_env=False)
+    except Exception:
+        quote_session = None
 
     def emit_line(s: str) -> None:
         sys.stdout.write(s + "\n")
@@ -610,14 +644,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     while True:
-        # 1) SGE spot quote (may fail intermittently)
-        try:
-            q = fetch_latest_quote(symbol=args.symbol, timeout_seconds=float(args.timeout))
-            consecutive_quote_failures = 0
-        except Exception as e:
-            consecutive_quote_failures += 1
-            emit_line(f"[{dt.datetime.now().isoformat(timespec='seconds')}] 获取行情失败: {e}")
-            q = None
+        # 1) SGE spot quote (minute-level; avoid hammering)
+        q = None
+        now_t = time.time()
+        should_fetch_quote = (now_t - last_quote_fetch_t) >= max(1.0, float(args.quote_min_interval))
+        if args.align_minute and should_fetch_quote:
+            # wait until next minute boundary + tiny jitter, then fetch
+            now_dt = dt.datetime.now()
+            next_min = (now_dt.replace(second=0, microsecond=0) + dt.timedelta(minutes=1))
+            wait_s = (next_min - now_dt).total_seconds()
+            # don't wait too long; only align when within a reasonable window
+            if 0.0 < wait_s < max(1.0, float(args.quote_min_interval) * 1.2):
+                time.sleep(wait_s + random.uniform(0.0, min(1.0, float(args.jitter))))
+                now_t = time.time()
+                should_fetch_quote = True
+
+        if should_fetch_quote:
+            last_quote_fetch_t = now_t
+            try:
+                q = fetch_latest_quote(
+                    symbol=args.symbol,
+                    timeout_seconds=float(args.timeout),
+                    session=quote_session,
+                )
+                consecutive_quote_failures = 0
+            except Exception as e:
+                consecutive_quote_failures += 1
+                emit_line(f"[{dt.datetime.now().isoformat(timespec='seconds')}] 获取行情失败: {e}")
+                q = None
 
         # 2) Futures proxy signal can still run even if spot quote fails
         if args.signal and not args.trades:
@@ -660,7 +714,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 2
             # Backoff on consecutive failures to reduce rate-limit risk
             backoff = min(float(args.max_fail_sleep), float(args.interval) * (2 ** max(0, consecutive_quote_failures - 1)))
-            time.sleep(max(1.0, backoff))
+            time.sleep(max(1.0, backoff) + random.uniform(0.0, max(0.0, float(args.jitter))))
             continue
 
         # De-dup: SGE endpoint may repeat last minute
@@ -725,7 +779,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.once:
             return 0
 
-        time.sleep(max(0.5, args.interval))
+        time.sleep(max(0.5, args.interval) + random.uniform(0.0, max(0.0, float(args.jitter))))
 
 
 if __name__ == "__main__":  # pragma: no cover
