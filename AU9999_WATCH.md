@@ -70,3 +70,14 @@ python3 au9999_watch.py \
   --futures-threshold-signed-volume 8000
 ```
 
+### 如果 AU9999 现货接口持续 403/超时
+
+上金所现货接口可能会对频繁请求或特定 IP 触发限制，表现为 **403 Forbidden** 或频繁断连。
+
+- 默认 `--spot auto`：一旦遇到 403，会自动暂停现货请求一段时间（`--spot-block-cooldown`，默认 1800 秒），避免刷屏与加重封禁。
+- 你也可以直接关闭现货请求，只看 `AU0` 期货代理：
+
+```bash
+python3 au9999_watch.py --signal --spot off
+```
+

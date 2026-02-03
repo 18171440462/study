@@ -29,6 +29,10 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
+class SpotQuoteBlocked(Exception):
+    """Raised when the spot quote endpoint returns a hard block (e.g., HTTP 403)."""
+
+
 def _lazy_import_akshare():
     try:
         import akshare as ak  # type: ignore
@@ -135,6 +139,11 @@ def fetch_latest_quote(
     }
     s = session or _requests_session_with_retries(trust_env=False)
     r = s.get(url, params=params, headers=headers, timeout=float(timeout_seconds))
+    if r.status_code == 403:
+        raise SpotQuoteBlocked(
+            f"SGE spot endpoint blocked (HTTP 403) for {symbol}. "
+            "This is usually rate-limit/WAF/IP-block; switch to futures proxy or back off."
+        )
     r.raise_for_status()
     data_json = r.json()
 
@@ -549,6 +558,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Align spot quote requests to next minute boundary (recommended for minute-level data)",
     )
+    ap.add_argument(
+        "--spot",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Spot quote mode: auto|on|off (default: auto). If blocked (403), auto will pause spot requests.",
+    )
+    ap.add_argument(
+        "--spot-block-cooldown",
+        type=int,
+        default=1800,
+        help="Seconds to pause spot requests after HTTP 403 (default: 1800)",
+    )
 
     ap.add_argument("--trades", default=None, help="Optional trades CSV path for net flow estimation")
     ap.add_argument("--lookback", type=int, default=600, help="Trade flow lookback seconds (default: 600)")
@@ -616,6 +637,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     last_futures_fetch_t: float = 0.0
     consecutive_quote_failures: int = 0
     last_quote_fetch_t: float = 0.0
+    spot_blocked_until: float = 0.0
     quote_session = None
     try:
         # Create one session (keep-alive), ignore env proxies by default.
@@ -647,7 +669,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 1) SGE spot quote (minute-level; avoid hammering)
         q = None
         now_t = time.time()
+        spot_enabled = args.spot in ("auto", "on")
+        spot_currently_blocked = (args.spot == "auto") and (now_t < spot_blocked_until)
+
         should_fetch_quote = (now_t - last_quote_fetch_t) >= max(1.0, float(args.quote_min_interval))
+        if not spot_enabled:
+            should_fetch_quote = False
+        if spot_currently_blocked:
+            should_fetch_quote = False
+
         if args.align_minute and should_fetch_quote:
             # wait until next minute boundary + tiny jitter, then fetch
             now_dt = dt.datetime.now()
@@ -668,6 +698,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                     session=quote_session,
                 )
                 consecutive_quote_failures = 0
+            except SpotQuoteBlocked as e:
+                # Hard block: pause further spot requests in auto mode.
+                consecutive_quote_failures += 1
+                if args.spot == "auto":
+                    spot_blocked_until = time.time() + int(args.spot_block_cooldown)
+                    emit_line(
+                        f"[{dt.datetime.now().isoformat(timespec='seconds')}] 获取现货被阻止(403)，"
+                        f"已暂停现货请求 {args.spot_block_cooldown}s（--spot auto）。原因: {e}"
+                    )
+                else:
+                    emit_line(f"[{dt.datetime.now().isoformat(timespec='seconds')}] 获取行情失败: {e}")
+                q = None
             except Exception as e:
                 consecutive_quote_failures += 1
                 emit_line(f"[{dt.datetime.now().isoformat(timespec='seconds')}] 获取行情失败: {e}")
